@@ -8,7 +8,6 @@
 
 import Cocoa
 
-
 class VideoView: NSView {
 
   weak var player: PlayerCore!
@@ -22,6 +21,7 @@ class VideoView: NSView {
   @ReadWriteAtomic var isUninited = false
 
   var draggingTimer: Timer?
+  var displayIdleTimer: Timer?
 
   // whether auto show playlist is triggered
   var playlistShown: Bool = false
@@ -34,16 +34,11 @@ class VideoView: NSView {
   // cached indicator to prevent unnecessary updates of DisplayLink
   var currentDisplay: UInt32?
 
-  private var displayIdleTimer: Timer?
-
   private lazy var hdrSubsystem = Logger.makeSubsystem("hdr\(player.playerNumber)")
 
   lazy var subsystem = Logger.makeSubsystem("video\(player.playerNumber)")
 
   static let SRGB = CGColorSpaceCreateDeviceRGB()
-
-  // record the last mouse up event which lands on video view
-  var lastEventId: Int?
 
   // MARK: - Attributes
 
@@ -86,14 +81,20 @@ class VideoView: NSView {
   /// - Important: Once mpv has been instructed to quit accessing the mpv core can result in a crash, therefore locks must be
   ///     used to coordinate uninitializing the view so that other threads do not attempt to use the mpv core while it is shutting down.
   func uninit() {
-    player.mpv.lockAndSetOpenGLContext()
-    defer { player.mpv.unlockOpenGLContext() }
     $isUninited.withWriteLock() { isUninited in
       guard !isUninited else { return }
       isUninited = true
 
+      // Stop timers to prevent retain cycles.
+      displayIdleTimer?.invalidate()
+      draggingTimer?.invalidate()
+
       stopDisplayLink()
-      player.mpv.mpvUninitRendering()
+      if let player = player {
+        player.mpv.lockAndSetOpenGLContext()
+        defer { player.mpv.unlockOpenGLContext() }
+        player.mpv.mpvUninitRendering()
+      }
     }
   }
 
@@ -113,7 +114,7 @@ class VideoView: NSView {
   ///
   /// See `MainWindowController.workaroundCursorDefect` and the issue for details on this workaround.
   override func rightMouseDown(with event: NSEvent) {
-    player.mainWindow.rightMouseDown(with: event)
+    player.mainWindow?.rightMouseDown(with: event)
     super.rightMouseDown(with: event)
   }
 
@@ -126,14 +127,13 @@ class VideoView: NSView {
   /// This appears to be a defect in the Cocoa framework. See the issue for details. As a workaround the mouse up event is caught in
   /// the view which then calls the window controller's method.
   override func mouseUp(with event: NSEvent) {
-    lastEventId = event.eventNumber
     // Only check for Big Sur or greater, not if the preference use legacy full screen is enabled as
     // that can be changed while running and once the window title has been removed and added back
     // AppKit malfunctions from then on. The check for running under Big Sur or later isn't really
     // needed as it would be fine to always call the controller. The check merely makes it clear
     // that this is only needed due to macOS changes starting with Big Sur.
     if #available(macOS 11, *) {
-      player.mainWindow.mouseUp(with: event)
+      player.mainWindow?.mouseUp(with: event)
     } else {
       super.mouseUp(with: event)
     }
@@ -147,7 +147,7 @@ class VideoView: NSView {
   }
 
   @objc func showPlaylist() {
-    player.mainWindow.menuShowPlaylistPanel(.dummy)
+    player.mainWindow?.menuShowPlaylistPanel(.dummy)
     playlistShown = true
   }
 
@@ -164,11 +164,12 @@ class VideoView: NSView {
   }
 
   override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-
-    guard !player.isInMiniPlayer && !playlistShown && hasPlayableFiles else { return super.draggingUpdated(sender) }
+    guard let player = player, let mainWindow = player.mainWindow, !player.isInMiniPlayer && !playlistShown && hasPlayableFiles else {
+      return super.draggingUpdated(sender)
+    }
 
     func inTriggerArea(_ point: NSPoint?) -> Bool {
-      guard let point = point, let frame = player.mainWindow.window?.frame else { return false }
+      guard let point = point, let frame = mainWindow.window?.frame else { return false }
       return point.x > (frame.maxX - frame.width * 0.2)
     }
 
@@ -197,7 +198,7 @@ class VideoView: NSView {
 
   override func draggingEnded(_ sender: NSDraggingInfo) {
     if playlistShown {
-      player.mainWindow.hideSideBar()
+      player.mainWindow?.hideSideBar()
     }
     playlistShown = false
     lastMousePosition = nil
@@ -216,15 +217,18 @@ class VideoView: NSView {
   /// - Returns: A [CVDisplayLink](https://developer.apple.com/documentation/corevideo/cvdisplaylink-k0k).
   private func obtainDisplayLink() -> CVDisplayLink {
     if let link = link { return link }
+    var link: CVDisplayLink?
     let result = CVDisplayLinkCreateWithActiveCGDisplays(&link)
     checkResult(result, "CVDisplayLinkCreateWithActiveCGDisplays")
     guard let link = link else {
       Logger.fatal("Cannot create display link: \(codeToString(result)) (\(result))")
     }
+    self.link = link
     return link
   }
 
   func startDisplayLink() {
+    guard window != nil else { return }
     let link = obtainDisplayLink()
     guard !CVDisplayLinkIsRunning(link) else { return }
     updateDisplayLink()
@@ -242,13 +246,17 @@ class VideoView: NSView {
 
   // This should only be called if the window has changed displays
   func updateDisplayLink() {
-    guard let window = window, let link = link, let screen = window.screen else { return }
-    let displayId = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! UInt32
+    guard let window = window, let screen = window.screen else { return }
+    guard let displayId = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32 else {
+      log("Failed to get display ID for screen", level: .warning)
+      return
+    }
 
     // Do nothing if on the same display
     if (currentDisplay == displayId) { return }
     currentDisplay = displayId
 
+    guard let link = link else { return }
     checkResult(CVDisplayLinkSetCurrentCGDisplay(link, displayId), "CVDisplayLinkSetCurrentCGDisplay")
     let actualData = CVDisplayLinkGetActualOutputVideoRefreshPeriod(link)
     let nominalData = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link)
@@ -269,7 +277,7 @@ class VideoView: NSView {
       log("Falling back to standard display refresh rate: 60 from \(actualFps)")
       actualFps = 60
     }
-    player.mpv.setDouble(MPVOption.Video.displayFpsOverride, actualFps)
+    player.mpv?.setDouble(MPVOption.Video.displayFpsOverride, actualFps)
 
     refreshEdrMode()
   }
@@ -310,17 +318,17 @@ class VideoView: NSView {
   }
 
   private func setICCProfile() {
-    let screenColorSpace = player.mainWindow.window?.screen?.colorSpace
+    let screenColorSpace = player.mainWindow?.window?.screen?.colorSpace
     if !Preference.bool(for: .loadIccProfile) {
       logHDR("Not using ICC profile due to user preference")
-      player.mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, false)
+      player.mpv?.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, false)
     } else if let screenColorSpace {
       let name = screenColorSpace.localizedName ?? "unnamed"
       logHDR("Using the ICC profile of the color space \(name)")
       // Set MPV_RENDER_PARAM_ICC_PROFILE before enabling icc-profile-auto to true as mpv requires
       // that parameter be set in the render context when icc-profile-auto is in use.
       videoLayer.setRenderICCProfile(screenColorSpace)
-      player.mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, true)
+      player.mpv?.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, true)
     }
 
     let sdrColorSpace = screenColorSpace?.cgColorSpace ?? VideoView.SRGB
@@ -333,12 +341,12 @@ class VideoView: NSView {
       log("Setting layer color space to \(name)")
       videoLayer.colorspace = sdrColorSpace
       videoLayer.wantsExtendedDynamicRangeContent = false
-      player.mpv.setString(MPVOption.GPURendererOptions.targetTrc, "auto")
-      player.mpv.setString(MPVOption.GPURendererOptions.targetPrim, "auto")
-      player.mpv.setString(MPVOption.GPURendererOptions.targetPeak, "auto")
-      player.mpv.setString(MPVOption.GPURendererOptions.toneMapping, "auto")
-      player.mpv.setString(MPVOption.GPURendererOptions.toneMappingParam, "default")
-      player.mpv.setFlag(MPVOption.Screenshot.screenshotTagColorspace, false)
+      player.mpv?.setString(MPVOption.GPURendererOptions.targetTrc, "auto")
+      player.mpv?.setString(MPVOption.GPURendererOptions.targetPrim, "auto")
+      player.mpv?.setString(MPVOption.GPURendererOptions.targetPeak, "auto")
+      player.mpv?.setString(MPVOption.GPURendererOptions.toneMapping, "auto")
+      player.mpv?.setString(MPVOption.GPURendererOptions.toneMappingParam, "default")
+      player.mpv?.setFlag(MPVOption.Screenshot.screenshotTagColorspace, false)
     }
   }
 
@@ -417,7 +425,7 @@ class VideoView: NSView {
 
 extension VideoView {
   func refreshEdrMode() {
-    guard player.mainWindow.loaded, player.info.state.loaded, let displayId = currentDisplay else { return }
+    guard let mainWindow = player.mainWindow, mainWindow.loaded, player.info.state.loaded, let displayId = currentDisplay else { return }
     if let screen = self.window?.screen {
       NSScreen.logEDR("Refreshing HDR for \(player.subsystem.rawValue) on display\(displayId)",
                       screen, subsystem: hdrSubsystem)
@@ -425,7 +433,7 @@ extension VideoView {
     let edrEnabled = requestEdrMode()
     let edrAvailable = edrEnabled != false
     if player.info.hdrAvailable != edrAvailable {
-      player.mainWindow.quickSettingView.setHdrAvailability(to: edrAvailable)
+      player.mainWindow?.quickSettingView.setHdrAvailability(to: edrAvailable)
     }
     if edrEnabled != true { setICCProfile() }
   }
@@ -437,7 +445,7 @@ extension VideoView {
       logHDR("Video gamma and primaries not available")
       return false
     }
-  
+
     let peak = mpv.getDouble(MPVProperty.videoParamsSigPeak)
     logHDR("Video gamma=\(gamma), primaries=\(primaries), sig_peak=\(peak)")
 
@@ -544,9 +552,11 @@ fileprivate func displayLinkCallback(
   _ flagsOut: UnsafeMutablePointer<CVOptionFlags>,
   _ context: UnsafeMutableRawPointer?) -> CVReturn {
   let videoView = unsafeBitCast(context, to: VideoView.self)
+  var isUninited = false
   videoView.$isUninited.withReadLock() { isUninited in
-    guard !isUninited else { return }
-    videoView.player.mpv.mpvReportSwap()
+    isUninited = isUninited
   }
+  guard !isUninited, let player = videoView.player else { return kCVReturnSuccess }
+  player.mpv.mpvReportSwap()
   return kCVReturnSuccess
 }
